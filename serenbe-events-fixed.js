@@ -1,7 +1,7 @@
 <script>
 /**
- * Serenbe Events - Fixed version with robust recurring handling + correct time-aware sorting
- * Fixes the issue where recurring events were not sorting by actual event time
+ * Serenbe Events - Fixed version with proper recurring events + time-based sorting
+ * Fixes: recurring events disappearing, time sorting within same day, loading indicator stuck
  */
 
 (function () {
@@ -30,8 +30,7 @@
   }
 
   // Parse "MM/DD/YYYY" or ISO "YYYY-MM-DD" (optionally with time)
-  // Return a local Date; if parts missing, return Invalid Date.
-  function parseDateFlexible(s) {
+  function parseDateTime(s) {
     if (!s) return new Date(NaN);
     s = String(s).trim();
 
@@ -71,6 +70,20 @@
     return new Date(s);
   }
 
+  // Format date as MM/DD/YYYY HH:MM AM/PM
+  function formatToMDY12h(date) {
+    const pad = (n) => (n < 10 ? `0${n}` : `${n}`);
+    const mm = pad(date.getMonth() + 1);
+    const dd = pad(date.getDate());
+    const yyyy = date.getFullYear();
+    let h = date.getHours();
+    const ap = h >= 12 ? "PM" : "AM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    const min = pad(date.getMinutes());
+    return `${mm}/${dd}/${yyyy} ${h}:${min} ${ap}`;
+  }
+
   // Extract a time from a string like "9:00 AM" or "14:30". Returns {h, m} or null.
   function parseTimeFromString(s) {
     if (!s) return null;
@@ -96,7 +109,7 @@
     return null;
   }
 
-  // Return time {h, m} using the best available hint from the DOM
+  // Get start time from various sources
   function getStartTime($el, originalStartText) {
     // 1) check explicit time fields
     const t1 = parseTimeFromString(firstText($el, TIME_SELECTORS));
@@ -104,7 +117,7 @@
     // 2) check if start-date text already contains a time
     const t2 = parseTimeFromString(originalStartText);
     if (t2) return t2;
-    // 3) default to 00:00 rather than guessing
+    // 3) default to 00:00
     return { h: 0, m: 0 };
   }
 
@@ -112,7 +125,7 @@
   function parseRule(raw) {
     const s = String(raw || '')
       .toLowerCase()
-      .replace(/[—–]/g, '-') // normalize en/em dashes to hyphen
+      .replace(/[—–]/g, '-')
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -125,7 +138,6 @@
       const dayNames = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
       const short = ['sun','mon','tue','wed','thu','fri','sat'];
 
-      // collect any day words present
       const matches = s.match(/sun(day)?|mon(day)?|tue(sday)?|wed(nesday)?|thu(rsday)?|fri(day)?|sat(urday)?/g) || [];
       for (const d of matches) {
         const name = d.slice(0,3).toLowerCase();
@@ -136,7 +148,6 @@
     }
 
     if (s.includes('monthly')) {
-      // grab any day numbers like 1, 2, 15, 31 with or without st/nd/rd/th
       const nums = (s.match(/(\d{1,2})(?:st|nd|rd|th)?/g) || [])
         .map(n => parseInt(n, 10))
         .filter(n => !Number.isNaN(n) && n >= 1 && n <= 31);
@@ -146,7 +157,7 @@
     return { type: null };
   }
 
-  // Next occurrence date (date-only) for a rule, constrained to not precede minDate
+  // Next occurrence date for a rule
   function nextOccurrence(rule, minDate, startDateLimit) {
     const base = new Date(minDate.getFullYear(), minDate.getMonth(), minDate.getDate());
     const limit = startDateLimit && !isNaN(startDateLimit) ?
@@ -160,38 +171,32 @@
     }
 
     if (rule.type === 'weekly') {
-      // search next 14 days
       for (let i = 0; i < 14; i++) {
         const c = new Date(notBefore);
         c.setDate(notBefore.getDate() + i);
         if (rule.days.includes(c.getDay())) return c;
       }
-      return notBefore; // fallback
+      return notBefore;
     }
 
     if (rule.type === 'monthly') {
       const y = notBefore.getFullYear();
       const m = notBefore.getMonth();
 
-      // try this month at or after notBefore
       for (const dom of rule.doms) {
-        const d = Math.min(dom, daysInMonth(y, m));
+        const d = Math.min(dom, new Date(y, m + 1, 0).getDate());
         const cand = new Date(y, m, d);
         if (cand >= notBefore) return cand;
       }
-      // else next month first listed
+      
       const nm = m + 1;
       const ny = m === 11 ? y + 1 : y;
       const mm = nm % 12;
-      const d = Math.min(rule.doms[0], daysInMonth(ny, mm));
+      const d = Math.min(rule.doms[0], new Date(ny, mm + 1, 0).getDate());
       return new Date(ny, mm, d);
     }
 
     return notBefore;
-  }
-
-  function daysInMonth(y, m) {
-    return new Date(y, m + 1, 0).getDate();
   }
 
   // Turn parts into a sortable local ISO key "YYYY-MM-DDTHH:MM"
@@ -200,7 +205,7 @@
     return `${y}-${p(m + 1)}-${p(d)}T${p(hh)}:${p(mm)}`;
   }
 
-  // Convert key to timestamp (ms). Assumes local time key format above.
+  // Convert key to timestamp (ms)
   function keyToTs(key) {
     const m = String(key || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
     if (!m) return NaN;
@@ -237,10 +242,7 @@
         return ranges
           .map(range =>
             range.includes('-')
-              ? range
-                  .split(' - ')
-                  .map(index => dayNames[index])
-                  .join(' - ')
+              ? range.split(' - ').map(index => dayNames[index]).join(' - ')
               : dayNames[range]
           )
           .join(', ');
@@ -267,7 +269,6 @@
     if (eventType.type === 'daily') return { top: 'Everyday', bottom: '' };
 
     if (eventType.type === 'weekly') {
-      // Convert JS dow 0..6 to our 0..6 where 0=mon for display helper used above
       const jsToMon0 = d => (d === 0 ? 6 : d - 1);
       const dayIdx = eventType.days.map(jsToMon0).sort((a,b)=>a-b);
       return { top: 'Every week', bottom: formatRange(dayIdx, true) };
@@ -294,7 +295,7 @@
     while (true) {
       out.push(`${months[m]} ${y}`);
       if (endDate) {
-        const e = parseDateFlexible(endDate);
+        const e = parseDateTime(endDate);
         if (!isNaN(e) && (y > e.getFullYear() || (y === e.getFullYear() && m >= e.getMonth()))) break;
       }
       if (!endDate && out.length === 12) break;
@@ -357,7 +358,6 @@
       .sort(function (a, b) {
         const ta = keyToTs($(a).attr(attrName));
         const tb = keyToTs($(b).attr(attrName));
-        // push NaNs to the end, keep stable tie-break on title to avoid jitter
         if (isNaN(ta) && isNaN(tb)) return 0;
         if (isNaN(ta)) return 1;
         if (isNaN(tb)) return -1;
@@ -371,7 +371,6 @@
       .appendTo($wrapper);
   }
 
-  // Build month tags on each card based on end-date
   function fillMonthTagsOnItem($el, endDateText) {
     const months = generateMonthList(endDateText);
     const $blk = $el.find('[filter="date-block"]');
@@ -388,89 +387,96 @@
   window.fsAttributes.push([
     'cmsload',
     listInstances => {
-      const [list] = listInstances;
-      loadFilterDropdown();
+      try {
+        const [list] = listInstances;
+        loadFilterDropdown();
 
-      const now = new Date();
-      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-      list.items.forEach(item => {
-        const $el = $(item.element);
+        list.items.forEach(item => {
+          const $el = $(item.element);
 
-        // Read the recurring rule
-        const ruleRaw = txt($el, '[date-recurring="formula"]').replace(/\s+/g, ' ');
-        const rule = parseRule(ruleRaw);
+          // Read the recurring rule
+          const ruleRaw = txt($el, '[date-recurring="formula"]').replace(/\s+/g, ' ');
+          const rule = parseRule(ruleRaw);
 
-        // Original dates from CMS
-        const startDateText = txt($el, '[cms-item="start-date"]');
-        const endDateText = txt($el, '[data-recurring="end-date"]') || txt($el, '[cms-item="end-date"]');
+          // Original dates from CMS
+          const startDateText = txt($el, '[cms-item="start-date"]');
+          const endDateText = txt($el, '[data-recurring="end-date"]') || txt($el, '[cms-item="end-date"]');
 
-        const startDateParsed = parseDateFlexible(startDateText); // date or datetime
-        const startTime = getStartTime($el, startDateText); // {h,m}
+          const startDateParsed = parseDateTime(startDateText);
+          const startTime = getStartTime($el, startDateText);
 
-        // Choose base date for recurrence: never before today and never before the CMS start date if provided
-        const base = isNaN(startDateParsed) ? today : new Date(
-          Math.max(today.getTime(), new Date(startDateParsed.getFullYear(), startDateParsed.getMonth(), startDateParsed.getDate()).getTime())
-        );
+          // Choose base date for recurrence
+          const base = isNaN(startDateParsed) ? today : new Date(
+            Math.max(today.getTime(), new Date(startDateParsed.getFullYear(), startDateParsed.getMonth(), startDateParsed.getDate()).getTime())
+          );
 
-        // Compute next occurrence date-only, then attach the real time for sort key
-        let occDate = base;
-        if (rule.type) {
-          occDate = nextOccurrence(rule, base, isNaN(startDateParsed) ? null : startDateParsed);
-        } else if (!isNaN(startDateParsed)) {
-          // Non recurring: just use the actual CMS start date
-          occDate = new Date(startDateParsed.getFullYear(), startDateParsed.getMonth(), startDateParsed.getDate());
-        }
+          // Compute next occurrence date
+          let occDate = base;
+          if (rule.type) {
+            occDate = nextOccurrence(rule, base, isNaN(startDateParsed) ? null : startDateParsed);
+            
+            // For recurring events, update the display date with the computed occurrence
+            const displayDate = new Date(occDate.getFullYear(), occDate.getMonth(), occDate.getDate(), startTime.h, startTime.m);
+            $el.find('[cms-item="start-date"]').text(formatToMDY12h(displayDate));
+          } else if (!isNaN(startDateParsed)) {
+            occDate = new Date(startDateParsed.getFullYear(), startDateParsed.getMonth(), startDateParsed.getDate());
+          }
 
-        const sortKey = toLocalIso(occDate.getFullYear(), occDate.getMonth(), occDate.getDate(), startTime.h, startTime.m);
-        $el.attr('data-sort-dt', sortKey);
+          // Create sort key with date + time
+          const sortKey = toLocalIso(occDate.getFullYear(), occDate.getMonth(), occDate.getDate(), startTime.h, startTime.m);
+          $el.attr('data-sort-dt', sortKey);
 
-        // End-date cleanup: remove expired items
-        if (endDateText) {
-          const end = parseDateFlexible(endDateText);
-          if (!isNaN(end)) {
-            const endOfDay = new Date(end.getFullYear(), end.getMonth(), end.getDate(), 23, 59, 59);
-            if (now > endOfDay) {
-              $el.remove();
-              return;
+          // Handle end dates
+          if (endDateText) {
+            const end = parseDateTime(endDateText);
+            if (!isNaN(end)) {
+              const endOfDay = new Date(end.getFullYear(), end.getMonth(), end.getDate(), 23, 59, 59);
+              if (now > endOfDay) {
+                $el.remove();
+                return;
+              }
+              const isoEnd = `${end.getFullYear()}-${String(end.getMonth()+1).padStart(2,'0')}-${String(end.getDate()).padStart(2,'0')}`;
+              $el.find('[cms-item="end-date"]').text(isoEnd);
             }
-            // Normalize end-date text to ISO YYYY-MM-DD for consistency if needed
-            const isoEnd = `${end.getFullYear()}-${String(end.getMonth()+1).padStart(2,'0')}-${String(end.getDate()).padStart(2,'0')}`;
+          } else {
+            const nextYear = new Date(today);
+            nextYear.setMonth(today.getMonth() + 12);
+            const isoEnd = `${nextYear.getFullYear()}-${String(nextYear.getMonth()+1).padStart(2,'0')}-${String(nextYear.getDate()).padStart(2,'0')}`;
             $el.find('[cms-item="end-date"]').text(isoEnd);
           }
-        } else {
-          // If no end, cap at 12 months by default
-          const nextYear = new Date(today);
-          nextYear.setMonth(today.getMonth() + 12);
-          const isoEnd = `${nextYear.getFullYear()}-${String(nextYear.getMonth()+1).padStart(2,'0')}-${String(nextYear.getDate()).padStart(2,'0')}`;
-          $el.find('[cms-item="end-date"]').text(isoEnd);
-        }
 
-        // Header text for recurring items
-        if (rule.type) {
-          if (rule.type === 'daily') {
-            $el.find('[data-date="month"]').text('');
-            $el.find('[data-date="start"]').text('Daily');
-          } else {
-            const header = getRecurringEventDisplay(rule);
-            $el.find('[data-date="month"]').text(header.top);
-            $el.find('[data-date="start"]').text(header.bottom);
+          // Header text for recurring items
+          if (rule.type) {
+            if (rule.type === 'daily') {
+              $el.find('[data-date="month"]').text('');
+              $el.find('[data-date="start"]').text('Daily');
+            } else {
+              const header = getRecurringEventDisplay(rule);
+              $el.find('[data-date="month"]').text(header.top);
+              $el.find('[data-date="start"]').text(header.bottom);
+            }
           }
-        }
 
-        // Month filter tags
-        fillMonthTagsOnItem($el, endDateText);
-      });
+          // Month filter tags
+          fillMonthTagsOnItem($el, endDateText);
+        });
 
-      // Sort by the computed data-sort-dt key
-      sortItemsByKey('#sliderParentEvents', 'data-sort-dt');
+        // Sort by the computed data-sort-dt key
+        sortItemsByKey('#sliderParentEvents', 'data-sort-dt');
 
-      // Bind filter controls
-      bindMonthFilter();
-      
-      // CRITICAL: Show the events and hide loading after everything is done
-      $('[data-type="events-col"]').show();
-      $('[data-role="loading"]').hide();
+        // Bind filter controls
+        bindMonthFilter();
+        
+      } catch (error) {
+        console.error('Serenbe events script error:', error);
+      } finally {
+        // ALWAYS show events and hide loading, even if there's an error
+        $('[data-type="events-col"]').show();
+        $('[data-role="loading"]').hide();
+      }
     }
   ]);
 })();
